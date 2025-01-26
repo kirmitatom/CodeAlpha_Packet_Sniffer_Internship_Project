@@ -3,9 +3,10 @@ import struct
 import argparse
 import time
 import json
-import curses
 from collections import defaultdict
 from cryptography.fernet import Fernet
+from rich.console import Console
+from rich.table import Table
 
 ANOMALY_THRESHOLD = 100  # Customize threshold for anomalies
 
@@ -15,6 +16,7 @@ blacklist = {
 }
 
 anomalies = defaultdict(int)
+console = Console()
 
 def parse_ethernet_header(data):
     dest_mac, src_mac, proto = struct.unpack('!6s6sH', data[:14])
@@ -71,27 +73,11 @@ def parse_icmp_header(data):
         'payload': data[4:]
     }
 
-def parse_dns_header(data):
-    transaction_id, flags, questions, answer_rrs, authority_rrs, additional_rrs = struct.unpack('!HHHHHH', data[:12])
-    return {
-        'transaction_id': transaction_id,
-        'flags': flags,
-        'questions': questions,
-        'answer_rrs': answer_rrs,
-        'authority_rrs': authority_rrs,
-        'additional_rrs': additional_rrs,
-        'payload': data[12:]
-    }
-
-def parse_http_payload(payload):
+def resolve_domain(ip_address):
     try:
-        http_data = payload.decode(errors='ignore')
-        if http_data.startswith("GET") or http_data.startswith("POST"):
-            headers = http_data.split("\r\n")
-            return {'headers': headers}
-    except UnicodeDecodeError:
-        pass
-    return None
+        return socket.gethostbyaddr(ip_address)[0]
+    except socket.herror:
+        return "Unknown Host"
 
 def format_mac(raw_mac):
     return ':'.join(format(byte, '02x') for byte in raw_mac)
@@ -115,23 +101,41 @@ def detect_anomalies(packet_info):
         if anomalies[ip_src] > ANOMALY_THRESHOLD:
             print(f"[ALERT] Potential anomaly detected from {ip_src} with {anomalies[ip_src]} packets.")
 
-def replay_packets(filename, interface):
-    print(f"[*] Replaying packets from {filename} on interface {interface}.")
-    with open(filename, 'r') as f:
-        packets = [json.loads(line) for line in f]
-    conn = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
-    conn.bind((interface, 0))
-    for packet in packets:
-        raw_data = reconstruct_packet(packet)
-        conn.send(raw_data)
-    print("[*] Replay completed.")
+def display_packet(packet_info):
+    table = Table(title="Captured Packet", show_lines=True)
 
-def reconstruct_packet(packet):
-    eth_header = struct.pack('!6s6sH', 
-                             bytes.fromhex(packet['ethernet']['dest_mac'].replace(':', '')),
-                             bytes.fromhex(packet['ethernet']['src_mac'].replace(':', '')),
-                             socket.htons(packet['ethernet']['protocol']))
-    return eth_header  # Simplified for demo, append IP/TCP/UDP data as needed
+    if "ethernet" in packet_info:
+        eth = packet_info["ethernet"]
+        table.add_column("Field", style="cyan", justify="right")
+        table.add_column("Value", style="green")
+        table.add_row("Timestamp", str(packet_info.get("timestamp", "")))
+        table.add_row("Source MAC", eth.get("src_mac", ""))
+        table.add_row("Destination MAC", eth.get("dest_mac", ""))
+        table.add_row("Ethernet Protocol", str(eth.get("protocol", "")))
+
+    if "ip" in packet_info:
+        ip = packet_info["ip"]
+        table.add_row("Source IP", ip.get("src_ip", ""))
+        table.add_row("Destination IP", ip.get("dst_ip", ""))
+        table.add_row("Destination Domain", ip.get("dst_domain", ""))
+        table.add_row("IP Protocol", str(ip.get("protocol", "")))
+
+    if "tcp" in packet_info:
+        tcp = packet_info["tcp"]
+        table.add_row("Source Port", str(tcp.get("src_port", "")))
+        table.add_row("Destination Port", str(tcp.get("dst_port", "")))
+
+    if "udp" in packet_info:
+        udp = packet_info["udp"]
+        table.add_row("Source Port", str(udp.get("src_port", "")))
+        table.add_row("Destination Port", str(udp.get("dst_port", "")))
+
+    if "icmp" in packet_info:
+        icmp = packet_info["icmp"]
+        table.add_row("ICMP Type", str(icmp.get("type", "")))
+        table.add_row("ICMP Code", str(icmp.get("code", "")))
+
+    console.print(table)
 
 def start_sniffer(interface=None, filters=None):
     conn = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.ntohs(0x0003))
@@ -163,9 +167,12 @@ def start_sniffer(interface=None, filters=None):
                 if ip['src_ip'] in blacklist['ip'] or ip['dst_ip'] in blacklist['ip']:
                     continue
 
+                domain_name = resolve_domain(ip['dst_ip'])
+
                 packet_info['ip'] = {
                     'src_ip': ip['src_ip'],
                     'dst_ip': ip['dst_ip'],
+                    'dst_domain': domain_name,
                     'protocol': ip['protocol']
                 }
 
@@ -177,9 +184,6 @@ def start_sniffer(interface=None, filters=None):
                         'src_port': tcp['src_port'],
                         'dst_port': tcp['dst_port']
                     }
-                    http = parse_http_payload(tcp['payload'])
-                    if http:
-                        packet_info['http'] = http
 
                 elif ip['protocol'] == 17:  # UDP
                     udp = parse_udp_header(ip['payload'])
@@ -193,7 +197,7 @@ def start_sniffer(interface=None, filters=None):
                     packet_info['icmp'] = icmp
 
             if not filters or packet_info.get('ip', {}).get('protocol') in filters:
-                print(f"Captured Packet: {packet_info}")
+                display_packet(packet_info)
                 save_packet(packet_info)
 
     except KeyboardInterrupt:
@@ -202,25 +206,10 @@ def start_sniffer(interface=None, filters=None):
         conn.close()
 
 def main():
-    parser = argparse.ArgumentParser(description="Packet Sniffer with Filters, Replay, and Anomaly Detection")
+    parser = argparse.ArgumentParser(description="Packet Sniffer with Domain Resolution and Anomaly Detection")
     parser.add_argument("-i", "--interface", help="Network interface to sniff on (default: all interfaces)")
     parser.add_argument("-f", "--filter", help="Filter by protocol (tcp, udp, all)", default="all")
-    parser.add_argument("-r", "--replay", help="Replay packets from a file")
-    parser.add_argument("-e", "--encrypt", help="Encrypt saved logs with a key")
     args = parser.parse_args()
-
-    if args.replay:
-        if not args.interface:
-            print("[ERROR] Interface is required for packet replay.")
-            return
-        replay_packets(args.replay, args.interface)
-        return
-
-    if args.encrypt:
-        key = Fernet.generate_key()
-        encrypt_log("packets.json", "encrypted_packets.pcap", key)
-        print(f"[*] Logs encrypted. Key: {key.decode()}")
-        return
 
     filters = None
     if args.filter.lower() == "tcp":
