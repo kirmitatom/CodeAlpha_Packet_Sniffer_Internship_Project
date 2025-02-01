@@ -2,6 +2,7 @@ import socket
 import struct
 import argparse
 import logging
+import threading
 from functools import lru_cache
 from rich.console import Console
 from rich.table import Table
@@ -66,15 +67,7 @@ def display_packet(packet_info):
         table.add_row("Destination Port", str(tcp.get("dst_port", "")))
     console.print(table)
 
-def start_sniffer(interface=None):
-    try:
-        conn = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.ntohs(0x0003))
-        if interface:
-            conn.bind((interface, 0))
-    except socket.error as e:
-        logging.error(f"Failed to bind to interface {interface}: {e}")
-        return
-    logging.info(f"Sniffing on {interface or 'all interfaces'}... Press Ctrl+C to stop.")
+def packet_handler(conn):
     try:
         while True:
             raw_data, _ = conn.recvfrom(65536)
@@ -102,6 +95,19 @@ def start_sniffer(interface=None):
         logging.error(f"Unexpected error: {e}")
     finally:
         conn.close()
+
+def start_sniffer(interface=None):
+    try:
+        conn = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.ntohs(0x0003))
+        if interface:
+            conn.bind((interface, 0))
+    except socket.error as e:
+        logging.error(f"Failed to bind to interface {interface}: {e}")
+        return
+    logging.info(f"Sniffing on {interface or 'all interfaces'}... Press Ctrl+C to stop.")
+    thread = threading.Thread(target=packet_handler, args=(conn,), daemon=True)
+    thread.start()
+    thread.join()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Packet sniffer for monitoring network traffic.")
